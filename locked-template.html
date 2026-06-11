@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+    <title>__TITLE__</title>
+    <style>
+        html, body {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            overflow: hidden; background: #000;
+            font-family: system-ui, "Segoe UI", Arial, sans-serif;
+        }
+        #app { width: 100%; height: 100%; display: block; touch-action: none; }
+        #loading {
+            position: fixed; inset: 0;
+            display: flex; flex-direction: column; gap: 14px;
+            align-items: center; justify-content: center;
+            background: #000; color: #cfd3da;
+            transition: opacity .6s ease; z-index: 10; font-size: 13px;
+        }
+        #loading.done { opacity: 0; pointer-events: none; }
+        #spin {
+            width: 26px; height: 26px; border-radius: 50%;
+            border: 3px solid rgba(255,255,255,.15); border-top-color: #fff;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        #hint {
+            position: fixed; left: 50%;
+            bottom: max(18px, env(safe-area-inset-bottom));
+            transform: translateX(-50%);
+            background: rgba(0,0,0,.55); color: #fff;
+            font-size: 12.5px; padding: 8px 16px; border-radius: 20px;
+            pointer-events: none; opacity: 0; transition: opacity .8s ease;
+            white-space: nowrap; z-index: 5;
+        }
+        #fs {
+            position: fixed;
+            right: max(14px, env(safe-area-inset-right));
+            bottom: max(14px, env(safe-area-inset-bottom));
+            width: 38px; height: 38px;
+            border: 0; border-radius: 8px;
+            background: rgba(0,0,0,.5); color: #fff; cursor: pointer;
+            display: flex; align-items: center; justify-content: center; z-index: 5;
+        }
+        #fs:hover { background: rgba(0,0,0,.78); }
+        #err {
+            position: fixed; inset: 0; display: none;
+            align-items: center; justify-content: center;
+            color: #ff9c9c; background: #000;
+            padding: 24px; text-align: center; font-size: 14px; z-index: 20;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="app"></canvas>
+    <div id="loading"><div id="spin"></div><div>Đang tải mô hình 3D…</div></div>
+    <div id="hint"></div>
+    <button id="fs" title="Toàn màn hình" aria-label="Toàn màn hình">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+        </svg>
+    </button>
+    <div id="err"></div>
+
+    <script type="module">
+        import * as pc from 'https://cdn.jsdelivr.net/npm/playcanvas@2/build/playcanvas.mjs';
+
+        // Cấu hình được ghi cứng khi xuất file — không đọc URL param.
+        // Giới hạn DUY NHẤT là phạm vi di chuyển của camera (mặt cầu bán kính R
+        // quanh tâm công trình). Góc nhìn tự do, dữ liệu splat nguyên vẹn.
+        const CFG = __CFG__;
+        const DATA = '__DATA__';
+        const NAME = '__NAME__';
+
+        const R = CFG.radiusM / CFG.mpu;
+        const TARGET_R = R * 0.5;
+        const MIN_DIST = 0.5;
+        const MAX_DIST = R * 2;
+        const PITCH_LIM = 89 * Math.PI / 180;
+        const DEG = Math.PI / 180;
+
+        const $ = function (id) { return document.getElementById(id); };
+        const canvas = $('app');
+
+        function fail(msg) {
+            $('loading').classList.add('done');
+            const e = $('err');
+            e.style.display = 'flex';
+            e.textContent = msg;
+        }
+
+        try {
+            const device = await pc.createGraphicsDevice(canvas, {
+                deviceTypes: ['webgl2'], antialias: false, powerPreference: 'high-performance'
+            });
+            device.maxPixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+
+            const opts = new pc.AppOptions();
+            opts.graphicsDevice = device;
+            opts.componentSystems = [pc.RenderComponentSystem, pc.CameraComponentSystem, pc.LightComponentSystem, pc.GSplatComponentSystem];
+            opts.resourceHandlers = [pc.TextureHandler, pc.ContainerHandler, pc.GSplatHandler];
+
+            const app = new pc.AppBase(canvas);
+            app.init(opts);
+            app.setCanvasFillMode(pc.FILLMODE_FILL_WINDOW);
+            app.setCanvasResolution(pc.RESOLUTION_AUTO);
+            window.addEventListener('resize', function () { app.resizeCanvas(); });
+
+            const bg = parseInt(CFG.bg, 16);
+            const cam = new pc.Entity('camera');
+            cam.addComponent('camera', {
+                clearColor: new pc.Color(((bg >> 16) & 255) / 255, ((bg >> 8) & 255) / 255, (bg & 255) / 255),
+                fov: CFG.fov, nearClip: 0.05, farClip: Math.max(2000, R * 4)
+            });
+            if (cam.camera && 'toneMapping' in cam.camera && pc.TONEMAP_NONE !== undefined) {
+                cam.camera.toneMapping = pc.TONEMAP_NONE;
+            }
+            app.root.addChild(cam);
+            app.start();
+
+            // Nạp dữ liệu splat nhúng (nguyên vẹn, không chỉnh sửa)
+            const blob = await (await fetch(DATA)).blob();
+            const url = URL.createObjectURL(blob);
+            const asset = new pc.Asset(NAME, 'gsplat', { url: url, filename: NAME });
+            app.assets.add(asset);
+            asset.on('error', function (err) { fail('Không tải được mô hình 3D: ' + err); });
+            asset.on('load', function () {
+                URL.revokeObjectURL(url);
+                const splat = new pc.Entity('splat');
+                splat.setLocalEulerAngles(0, 0, 180); // quy ước SuperSplat
+                splat.addComponent('gsplat', { asset: asset });
+                app.root.addChild(splat);
+                $('loading').classList.add('done');
+                const hint = $('hint');
+                hint.textContent = ('ontouchstart' in window)
+                    ? '1 ngón: xoay · 2 ngón: thu phóng / di chuyển'
+                    : 'Kéo chuột: xoay · Lăn chuột: thu phóng · Chuột phải: di chuyển';
+                hint.style.opacity = '1';
+                setTimeout(function () { hint.style.opacity = '0'; }, 5000);
+            });
+            app.assets.load(asset);
+
+            // Điều khiển quỹ đạo — giới hạn duy nhất: mặt cầu di chuyển
+            const center  = new pc.Vec3(CFG.center[0], CFG.center[1], CFG.center[2]);
+            const tgt     = new pc.Vec3(CFG.tgt[0], CFG.tgt[1], CFG.tgt[2]);
+            const tgtGoal = tgt.clone();
+
+            const off0 = new pc.Vec3(CFG.pos[0], CFG.pos[1], CFG.pos[2]).sub(tgt);
+            let dist  = off0.length();
+            let yaw   = Math.atan2(off0.x, off0.z);
+            let pitch = Math.asin(Math.max(-1, Math.min(1, off0.y / dist)));
+            let yawGoal = yaw, pitchGoal = pitch, distGoal = dist;
+
+            const clampPitch = function (p) { return Math.min(PITCH_LIM, Math.max(-PITCH_LIM, p)); };
+            const clampDist  = function (d) { return Math.min(MAX_DIST, Math.max(MIN_DIST, d)); };
+
+            let interacted = false;
+            const pointers = new Map();
+            let lastPinch = 0;
+
+            function pan(dx, dy) {
+                const wpp = 2 * dist * Math.tan(CFG.fov * DEG / 2) / canvas.clientHeight;
+                tgtGoal.sub(new pc.Vec3().copy(cam.right).mulScalar(dx * wpp));
+                tgtGoal.add(new pc.Vec3().copy(cam.up).mulScalar(dy * wpp));
+                const o = new pc.Vec3().sub2(tgtGoal, center);
+                if (o.length() > TARGET_R) {
+                    o.normalize().mulScalar(TARGET_R);
+                    tgtGoal.add2(center, o);
+                }
+            }
+
+            canvas.addEventListener('pointerdown', function (e) {
+                try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+                pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, button: e.button });
+                interacted = true;
+            });
+            canvas.addEventListener('pointermove', function (e) {
+                const p = pointers.get(e.pointerId);
+                if (!p) return;
+                const dx = e.clientX - p.x, dy = e.clientY - p.y;
+                p.x = e.clientX; p.y = e.clientY;
+                if (pointers.size === 2) {
+                    const vals = [...pointers.values()];
+                    const pinch = Math.hypot(vals[0].x - vals[1].x, vals[0].y - vals[1].y);
+                    if (lastPinch > 0) distGoal = clampDist(distGoal * lastPinch / pinch);
+                    lastPinch = pinch;
+                    pan(dx / 2, dy / 2);
+                } else if (p.button === 2 || p.button === 1 || e.shiftKey) {
+                    pan(dx, dy);
+                } else {
+                    yawGoal  -= dx * 0.0045;
+                    pitchGoal = clampPitch(pitchGoal + dy * 0.0045);
+                }
+            });
+            const endPointer = function (e) { pointers.delete(e.pointerId); lastPinch = 0; };
+            canvas.addEventListener('pointerup', endPointer);
+            canvas.addEventListener('pointercancel', endPointer);
+            canvas.addEventListener('wheel', function (e) {
+                e.preventDefault();
+                interacted = true;
+                distGoal = clampDist(distGoal * Math.exp(e.deltaY * 0.0012));
+            }, { passive: false });
+            canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+            const dir = new pc.Vec3(), o = new pc.Vec3(), posv = new pc.Vec3();
+            app.on('update', function (dt) {
+                if (CFG.autorotate && !interacted) yawGoal += dt * 0.12;
+
+                const s = 1 - Math.exp(-dt * 10);
+                yaw   += (yawGoal   - yaw)   * s;
+                pitch += (pitchGoal - pitch) * s;
+                dist  += (distGoal  - dist)  * s;
+                tgt.lerp(tgt, tgtGoal, s);
+
+                const cp = Math.cos(pitch);
+                dir.set(cp * Math.sin(yaw), Math.sin(pitch), cp * Math.cos(yaw));
+
+                o.sub2(tgt, center);
+                const b = 2 * o.dot(dir);
+                const disc = Math.max(0, b * b - 4 * (o.dot(o) - R * R));
+                const dMax = (-b + Math.sqrt(disc)) / 2;
+                if (dist > dMax) {
+                    dist = dMax;
+                    distGoal = Math.min(distGoal, dMax);
+                }
+                posv.copy(dir).mulScalar(Math.max(MIN_DIST * 0.5, dist)).add(tgt);
+                cam.setPosition(posv);
+                cam.lookAt(tgt);
+            });
+
+            $('fs').addEventListener('click', function () {
+                if (document.fullscreenElement) document.exitFullscreen();
+                else document.documentElement.requestFullscreen().catch(function () {});
+            });
+
+            // handle chẩn đoán tối thiểu (không cho phép đổi giới hạn qua UI/URL)
+            window.__v = {
+                R: R,
+                distFromCenter: function () { return new pc.Vec3().sub2(cam.getPosition(), center).length(); },
+                app: app
+            };
+        } catch (err) {
+            fail('Trình duyệt không hỗ trợ WebGL2 hoặc có lỗi khởi tạo: ' + (err && err.message ? err.message : err));
+        }
+    </script>
+</body>
+</html>

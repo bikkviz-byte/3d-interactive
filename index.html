@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+    <title>Choisy — 3D Gaussian Splat Viewer</title>
+    <style>
+        html, body {
+            margin: 0; padding: 0;
+            width: 100%; height: 100%;
+            overflow: hidden;
+            background: #000;
+            font-family: system-ui, "Segoe UI", Arial, sans-serif;
+        }
+        #app {
+            width: 100%; height: 100%;
+            display: block;
+            touch-action: none;
+            outline: none;
+        }
+        #loading {
+            position: fixed; inset: 0;
+            display: flex; flex-direction: column; gap: 14px;
+            align-items: center; justify-content: center;
+            background: #000; color: #cfd3da;
+            transition: opacity .6s ease;
+            z-index: 10;
+        }
+        #loading.done { opacity: 0; pointer-events: none; }
+        #bar {
+            width: min(46vw, 260px); height: 3px;
+            background: rgba(255,255,255,.15);
+            border-radius: 2px; overflow: hidden;
+        }
+        #fill {
+            height: 100%; width: 0%;
+            background: #fff; border-radius: 2px;
+            transition: width .15s ease;
+        }
+        #pct { font-size: 12px; letter-spacing: .08em; }
+        #hint {
+            position: fixed; left: 50%;
+            bottom: max(18px, env(safe-area-inset-bottom));
+            transform: translateX(-50%);
+            background: rgba(0,0,0,.55); color: #fff;
+            font-size: 12.5px; padding: 8px 16px;
+            border-radius: 20px;
+            pointer-events: none;
+            opacity: 0; transition: opacity .8s ease;
+            white-space: nowrap; z-index: 5;
+        }
+        #fs {
+            position: fixed;
+            right: max(14px, env(safe-area-inset-right));
+            bottom: max(14px, env(safe-area-inset-bottom));
+            width: 38px; height: 38px;
+            border: 0; border-radius: 8px;
+            background: rgba(0,0,0,.5); color: #fff;
+            cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            z-index: 5;
+        }
+        #fs:hover { background: rgba(0,0,0,.78); }
+        #err {
+            position: fixed; inset: 0;
+            display: none;
+            align-items: center; justify-content: center;
+            color: #ff9c9c; background: #000;
+            padding: 24px; text-align: center;
+            font-size: 14px; z-index: 20;
+        }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+    <canvas id="app"></canvas>
+
+    <div id="loading">
+        <div id="bar"><div id="fill"></div></div>
+        <div id="pct">Đang tải mô hình…</div>
+    </div>
+
+    <div id="hint"></div>
+
+    <button id="fs" title="Toàn màn hình" aria-label="Toàn màn hình">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+        </svg>
+    </button>
+
+    <div id="err"></div>
+
+    <script type="module">
+        import * as pc from 'https://cdn.jsdelivr.net/npm/playcanvas@2/build/playcanvas.mjs';
+
+        /* ---------------------------------------------------------------
+         * CẤU HÌNH — tất cả chỉnh được qua URL param, KHÔNG cần sửa code.
+         * Ví dụ:  index.html?radius=150&mpu=10&autorotate=1
+         *
+         *   src        đường dẫn file .sog/.ply        (mặc định ./index.sog)
+         *   radius     bán kính giới hạn, tính bằng MÉT (mặc định 150)
+         *   mpu        số mét ứng với 1 đơn vị scene    (mặc định 10 — cần hiệu chỉnh!)
+         *   center     tâm giới hạn "x,y,z"             (mặc định = tâm công trình)
+         *   pos        vị trí camera ban đầu "x,y,z"
+         *   fov        góc nhìn camera (độ)
+         *   bg         màu nền hex, vd bg=1a1d24
+         *   autorotate =1 để tự xoay quanh công trình tới khi khách chạm vào
+         *   elev       giới hạn góc cao "min,max" độ    (mặc định -10,85)
+         *   ui         =0 để ẩn nút + gợi ý điều khiển
+         * --------------------------------------------------------------- */
+        const q = new URLSearchParams(location.search);
+        const num = (k, d) => q.has(k) && isFinite(parseFloat(q.get(k))) ? parseFloat(q.get(k)) : d;
+        const vec = (k, d) => {
+            if (!q.has(k)) return d;
+            const a = q.get(k).split(',').map(Number);
+            return (a.length === 3 && a.every(isFinite)) ? a : d;
+        };
+
+        const CFG = {
+            url:        q.get('src') || './index.sog',
+            radiusM:    num('radius', 150),
+            mpu:        num('mpu', 10),
+            center:     vec('center', [-0.951, -0.229, 2.605]),
+            pos:        vec('pos',    [3.586,  2.324,  7.048]),
+            fov:        num('fov', 65),
+            bg:         (q.get('bg') || '000000').replace('#', ''),
+            autorotate: q.get('autorotate') === '1',
+            elev:       (q.get('elev') || '-89,89').split(',').map(Number),
+            ui:         q.get('ui') !== '0'
+        };
+
+        // Bán kính giới hạn quy về đơn vị scene
+        const R = CFG.radiusM / CFG.mpu;
+        const TARGET_R = R * 0.5;   // tâm nhìn (pan) bó hẹp hơn để camera không lạc khỏi công trình
+        const MIN_DIST = 0.5;
+        const MAX_DIST = R * 2;
+
+        const $ = id => document.getElementById(id);
+        const canvas = $('app');
+
+        function fail(msg) {
+            $('loading').classList.add('done');
+            const e = $('err');
+            e.style.display = 'flex';
+            e.textContent = msg;
+        }
+
+        try {
+            const device = await pc.createGraphicsDevice(canvas, {
+                deviceTypes: ['webgl2'],
+                antialias: false,
+                powerPreference: 'high-performance'
+            });
+            device.maxPixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+
+            const opts = new pc.AppOptions();
+            opts.graphicsDevice = device;
+            opts.componentSystems = [
+                pc.RenderComponentSystem,
+                pc.CameraComponentSystem,
+                pc.LightComponentSystem,
+                pc.GSplatComponentSystem
+            ];
+            opts.resourceHandlers = [pc.TextureHandler, pc.ContainerHandler, pc.GSplatHandler];
+
+            const app = new pc.AppBase(canvas);
+            app.init(opts);
+            app.setCanvasFillMode(pc.FILLMODE_FILL_WINDOW);
+            app.setCanvasResolution(pc.RESOLUTION_AUTO);
+            window.addEventListener('resize', () => app.resizeCanvas());
+
+            // ---- camera -------------------------------------------------
+            const bg = parseInt(CFG.bg, 16);
+            const cam = new pc.Entity('camera');
+            cam.addComponent('camera', {
+                clearColor: new pc.Color(((bg >> 16) & 255) / 255, ((bg >> 8) & 255) / 255, (bg & 255) / 255),
+                fov: CFG.fov,
+                nearClip: 0.05,
+                farClip: Math.max(100, R * 4)
+            });
+            if (cam.camera && 'toneMapping' in cam.camera && pc.TONEMAP_NONE !== undefined) {
+                cam.camera.toneMapping = pc.TONEMAP_NONE;
+            }
+            app.root.addChild(cam);
+            app.start();
+
+            // ---- tải splat ----------------------------------------------
+            const asset = new pc.Asset('scene', 'gsplat', { url: CFG.url });
+            app.assets.add(asset);
+            asset.on('progress', (received, length) => {
+                if (length > 0) {
+                    const p = Math.min(100, Math.round(received / length * 100));
+                    $('fill').style.width = p + '%';
+                    $('pct').textContent = 'Đang tải mô hình… ' + p + '%';
+                }
+            });
+            asset.on('error', err => fail('Không tải được mô hình 3D: ' + err));
+            asset.on('load', () => {
+                const splat = new pc.Entity('splat');
+                // SuperSplat xuất dữ liệu với trục lật — viewer gốc cũng xoay đúng như vậy
+                splat.setLocalEulerAngles(0, 0, 180);
+                splat.addComponent('gsplat', { asset });
+                app.root.addChild(splat);
+
+                $('loading').classList.add('done');
+                if (CFG.ui) {
+                    const hint = $('hint');
+                    hint.textContent = ('ontouchstart' in window)
+                        ? '1 ngón: xoay · 2 ngón: thu phóng / di chuyển'
+                        : 'Kéo chuột: xoay · Lăn chuột: thu phóng · Chuột phải: di chuyển';
+                    hint.style.opacity = '1';
+                    setTimeout(() => { hint.style.opacity = '0'; }, 5000);
+                } else {
+                    $('fs').classList.add('hidden');
+                }
+            });
+            app.assets.load(asset);
+
+            // ---- điều khiển quỹ đạo + giới hạn bán kính ------------------
+            const center  = new pc.Vec3(...CFG.center);
+            const tgt     = new pc.Vec3(...CFG.center);
+            const tgtGoal = new pc.Vec3(...CFG.center);
+
+            const off0 = new pc.Vec3(...CFG.pos).sub(center);
+            let dist     = off0.length();
+            let yaw      = Math.atan2(off0.x, off0.z);
+            let pitch    = Math.asin(off0.y / dist);
+            let yawGoal = yaw, pitchGoal = pitch, distGoal = dist;
+
+            const DEG = Math.PI / 180;
+            const PITCH_MIN = Math.max(-89, CFG.elev[0]) * DEG;
+            const PITCH_MAX = Math.min( 89, CFG.elev[1]) * DEG;
+            const clampPitch = p => Math.min(PITCH_MAX, Math.max(PITCH_MIN, p));
+            const clampDist  = d => Math.min(MAX_DIST, Math.max(MIN_DIST, d));
+
+            let interacted = false;
+            const pointers = new Map();
+            let lastPinch = 0;
+
+            function pan(dx, dy) {
+                const wpp = 2 * dist * Math.tan(CFG.fov * DEG / 2) / canvas.clientHeight;
+                tgtGoal.sub(new pc.Vec3().copy(cam.right).mulScalar(dx * wpp));
+                tgtGoal.add(new pc.Vec3().copy(cam.up).mulScalar(dy * wpp));
+                // giữ tâm nhìn trong nửa bán kính quanh công trình
+                const o = new pc.Vec3().sub2(tgtGoal, center);
+                if (o.length() > TARGET_R) {
+                    o.normalize().mulScalar(TARGET_R);
+                    tgtGoal.add2(center, o);
+                }
+            }
+
+            canvas.addEventListener('pointerdown', e => {
+                try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+                pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, button: e.button });
+                interacted = true;
+            });
+            canvas.addEventListener('pointermove', e => {
+                const p = pointers.get(e.pointerId);
+                if (!p) return;
+                const dx = e.clientX - p.x, dy = e.clientY - p.y;
+                p.x = e.clientX; p.y = e.clientY;
+                if (pointers.size === 2) {
+                    const [a, b] = [...pointers.values()];
+                    const pinch = Math.hypot(a.x - b.x, a.y - b.y);
+                    if (lastPinch > 0) distGoal = clampDist(distGoal * lastPinch / pinch);
+                    lastPinch = pinch;
+                    pan(dx / 2, dy / 2);
+                } else if (p.button === 2 || p.button === 1 || e.shiftKey) {
+                    pan(dx, dy);
+                } else {
+                    yawGoal  -= dx * 0.0045;
+                    pitchGoal = clampPitch(pitchGoal + dy * 0.0045);
+                }
+            });
+            const endPointer = e => { pointers.delete(e.pointerId); lastPinch = 0; };
+            canvas.addEventListener('pointerup', endPointer);
+            canvas.addEventListener('pointercancel', endPointer);
+            canvas.addEventListener('wheel', e => {
+                e.preventDefault();
+                interacted = true;
+                distGoal = clampDist(distGoal * Math.exp(e.deltaY * 0.0012));
+            }, { passive: false });
+            canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+            const dir = new pc.Vec3(), o = new pc.Vec3(), posv = new pc.Vec3();
+            app.on('update', dt => {
+                if (CFG.autorotate && !interacted) yawGoal += dt * 0.12;
+
+                const s = 1 - Math.exp(-dt * 10);
+                yaw   += (yawGoal   - yaw)   * s;
+                pitch += (pitchGoal - pitch) * s;
+                dist  += (distGoal  - dist)  * s;
+                tgt.lerp(tgt, tgtGoal, s);
+
+                const cp = Math.cos(pitch);
+                dir.set(cp * Math.sin(yaw), Math.sin(pitch), cp * Math.cos(yaw));
+
+                // Giới hạn bán kính: cắt khoảng cách camera tại mặt cầu (center, R)
+                o.sub2(tgt, center);
+                const b = 2 * o.dot(dir);
+                const disc = Math.max(0, b * b - 4 * (o.dot(o) - R * R));
+                const dMax = (-b + Math.sqrt(disc)) / 2;
+                if (dist > dMax) {
+                    dist = dMax;
+                    distGoal = Math.min(distGoal, dMax); // để thao tác zoom-in phản hồi ngay
+                }
+                const d = Math.max(MIN_DIST * 0.5, dist);
+
+                posv.copy(dir).mulScalar(d).add(tgt);
+                cam.setPosition(posv);
+                cam.lookAt(tgt);
+            });
+
+            // Handle nhỏ cho debug / tích hợp nâng cao
+            window.__viewer = {
+                cfg: CFG,
+                radiusUnits: R,
+                distFromCenter: () => new pc.Vec3().sub2(cam.getPosition(), center).length(),
+                get _state() { return { dist, distGoal, yaw, pitch, tgt: tgt.toString() }; },
+                _app: app
+            };
+
+            // ---- toàn màn hình ------------------------------------------
+            $('fs').addEventListener('click', () => {
+                if (document.fullscreenElement) document.exitFullscreen();
+                else document.documentElement.requestFullscreen().catch(() => {});
+            });
+
+        } catch (err) {
+            fail('Trình duyệt không hỗ trợ WebGL2 hoặc có lỗi khởi tạo: ' + (err && err.message ? err.message : err));
+        }
+    </script>
+</body>
+</html>
