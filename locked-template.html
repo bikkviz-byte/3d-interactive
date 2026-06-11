@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="vi">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
@@ -25,15 +25,68 @@
             animation: spin 1s linear infinite;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
-        #hint {
-            position: fixed; left: 50%;
-            bottom: max(18px, env(safe-area-inset-bottom));
-            transform: translateX(-50%);
-            background: rgba(0,0,0,.55); color: #fff;
-            font-size: 12.5px; padding: 8px 16px; border-radius: 20px;
-            pointer-events: none; opacity: 0; transition: opacity .8s ease;
-            white-space: nowrap; z-index: 5;
+
+        /* ── Navigation help overlay ── */
+        #ctrlPanel {
+            position: fixed; inset: 0;
+            display: flex; align-items: center; justify-content: center;
+            background: rgba(0,0,0,.45);
+            z-index: 8;
+            transition: opacity .35s ease;
         }
+        #ctrlPanel.hidden { opacity: 0; pointer-events: none; }
+        #ctrlBox {
+            background: rgba(18,20,28,.92);
+            border: 1px solid rgba(255,255,255,.12);
+            border-radius: 14px;
+            padding: 22px 28px 18px;
+            min-width: 260px;
+            backdrop-filter: blur(8px);
+        }
+        #ctrlBox h3 {
+            margin: 0 0 14px; font-size: 12px; font-weight: 600;
+            text-transform: uppercase; letter-spacing: .12em;
+            color: #8b93a5;
+        }
+        .ctrlRow {
+            display: flex; justify-content: space-between; align-items: center;
+            gap: 20px; padding: 5px 0;
+            font-size: 13px; color: #d6dae2;
+            border-bottom: 1px solid rgba(255,255,255,.06);
+        }
+        .ctrlRow:last-of-type { border-bottom: 0; }
+        .ctrlKey {
+            background: rgba(255,255,255,.1); border-radius: 5px;
+            padding: 2px 8px; font-size: 11.5px; color: #aab1c0;
+            white-space: nowrap;
+        }
+        .touch { display: none; }
+        .is-touch .touch { display: flex; }
+        .is-touch .mouse { display: none; }
+        #ctrlClose {
+            display: block; width: 100%; margin-top: 16px;
+            background: #2f5ed1; color: #fff;
+            border: 0; border-radius: 8px;
+            padding: 8px; font-size: 13px; cursor: pointer;
+            letter-spacing: .04em;
+        }
+        #ctrlClose:hover { background: #3a6ce6; }
+
+        /* ── Help button (always visible) ── */
+        #ctrlHelp {
+            position: fixed;
+            left: max(14px, env(safe-area-inset-left));
+            bottom: max(14px, env(safe-area-inset-bottom));
+            width: 34px; height: 34px;
+            border: 1px solid rgba(255,255,255,.2); border-radius: 50%;
+            background: rgba(0,0,0,.5); color: #aab1c0;
+            font-size: 15px; font-weight: 700; cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            z-index: 5; transition: background .2s;
+        }
+        #ctrlHelp:hover { background: rgba(0,0,0,.8); color: #fff; }
+
+        /* ── Fullscreen button ── */
         #fs {
             position: fixed;
             right: max(14px, env(safe-area-inset-right));
@@ -54,9 +107,23 @@
 </head>
 <body>
     <canvas id="app"></canvas>
-    <div id="loading"><div id="spin"></div><div>Đang tải mô hình 3D…</div></div>
-    <div id="hint"></div>
-    <button id="fs" title="Toàn màn hình" aria-label="Toàn màn hình">
+    <div id="loading"><div id="spin"></div><div>Loading 3D model…</div></div>
+
+    <!-- Navigation instructions overlay -->
+    <div id="ctrlPanel" class="hidden">
+        <div id="ctrlBox">
+            <h3>Navigation</h3>
+            <div class="ctrlRow mouse"><span class="ctrlKey">Left drag</span><span>Rotate view</span></div>
+            <div class="ctrlRow mouse"><span class="ctrlKey">Scroll wheel</span><span>Zoom in / out</span></div>
+            <div class="ctrlRow mouse"><span class="ctrlKey">Right drag</span><span>Pan camera</span></div>
+            <div class="ctrlRow touch"><span class="ctrlKey">1 finger</span><span>Rotate view</span></div>
+            <div class="ctrlRow touch"><span class="ctrlKey">2 fingers</span><span>Zoom &amp; pan</span></div>
+            <button id="ctrlClose">Got it</button>
+        </div>
+    </div>
+    <button id="ctrlHelp" title="Navigation help">?</button>
+
+    <button id="fs" title="Fullscreen" aria-label="Fullscreen">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
         </svg>
@@ -66,9 +133,8 @@
     <script type="module">
         import * as pc from 'https://cdn.jsdelivr.net/npm/playcanvas@2/build/playcanvas.mjs';
 
-        // Cấu hình được ghi cứng khi xuất file — không đọc URL param.
-        // Giới hạn DUY NHẤT là phạm vi di chuyển của camera (mặt cầu bán kính R
-        // quanh tâm công trình). Góc nhìn tự do, dữ liệu splat nguyên vẹn.
+        // Config locked at export time — no URL params, no UI to change limits.
+        // Only restriction: camera movement sphere. View angle free, splat data intact.
         const CFG = __CFG__;
         const DATA = '__DATA__';
         const NAME = '__NAME__';
@@ -83,12 +149,25 @@
         const $ = function (id) { return document.getElementById(id); };
         const canvas = $('app');
 
+        // Detect touch device
+        if ('ontouchstart' in window) document.body.classList.add('is-touch');
+
         function fail(msg) {
             $('loading').classList.add('done');
             const e = $('err');
             e.style.display = 'flex';
             e.textContent = msg;
         }
+
+        // ── Instructions overlay ─────────────────────────────────────────
+        const ctrlPanel = $('ctrlPanel');
+        function showHelp() { ctrlPanel.classList.remove('hidden'); }
+        function hideHelp() { ctrlPanel.classList.add('hidden'); }
+        $('ctrlClose').addEventListener('click', hideHelp);
+        $('ctrlHelp').addEventListener('click', showHelp);
+        ctrlPanel.addEventListener('click', function (e) {
+            if (e.target === ctrlPanel) hideHelp();
+        });
 
         try {
             const device = await pc.createGraphicsDevice(canvas, {
@@ -105,7 +184,13 @@
             app.init(opts);
             app.setCanvasFillMode(pc.FILLMODE_FILL_WINDOW);
             app.setCanvasResolution(pc.RESOLUTION_AUTO);
-            window.addEventListener('resize', function () { app.resizeCanvas(); });
+
+            // ── FOV fix: mirror SuperSplat — horizontal FOV on landscape ──
+            function applyFov() {
+                cam.camera.fov = CFG.fov;
+                cam.camera.horizontalFov = window.innerWidth > window.innerHeight;
+            }
+            window.addEventListener('resize', function () { app.resizeCanvas(); applyFov(); });
 
             const bg = parseInt(CFG.bg, 16);
             const cam = new pc.Entity('camera');
@@ -118,30 +203,26 @@
             }
             app.root.addChild(cam);
             app.start();
+            applyFov(); // apply horizontal/vertical after start
 
-            // Nạp dữ liệu splat nhúng (nguyên vẹn, không chỉnh sửa)
+            // ── Load embedded splat data (intact, unmodified) ────────────
             const blob = await (await fetch(DATA)).blob();
             const url = URL.createObjectURL(blob);
             const asset = new pc.Asset(NAME, 'gsplat', { url: url, filename: NAME });
             app.assets.add(asset);
-            asset.on('error', function (err) { fail('Không tải được mô hình 3D: ' + err); });
+            asset.on('error', function (err) { fail('Failed to load 3D model: ' + err); });
             asset.on('load', function () {
                 URL.revokeObjectURL(url);
                 const splat = new pc.Entity('splat');
-                splat.setLocalEulerAngles(0, 0, 180); // quy ước SuperSplat
+                splat.setLocalEulerAngles(0, 0, 180); // SuperSplat convention
                 splat.addComponent('gsplat', { asset: asset });
                 app.root.addChild(splat);
                 $('loading').classList.add('done');
-                const hint = $('hint');
-                hint.textContent = ('ontouchstart' in window)
-                    ? '1 ngón: xoay · 2 ngón: thu phóng / di chuyển'
-                    : 'Kéo chuột: xoay · Lăn chuột: thu phóng · Chuột phải: di chuyển';
-                hint.style.opacity = '1';
-                setTimeout(function () { hint.style.opacity = '0'; }, 5000);
+                showHelp(); // show navigation guide on load
             });
             app.assets.load(asset);
 
-            // Điều khiển quỹ đạo — giới hạn duy nhất: mặt cầu di chuyển
+            // ── Orbit controls — only restriction: movement sphere ────────
             const center  = new pc.Vec3(CFG.center[0], CFG.center[1], CFG.center[2]);
             const tgt     = new pc.Vec3(CFG.tgt[0], CFG.tgt[1], CFG.tgt[2]);
             const tgtGoal = tgt.clone();
@@ -160,7 +241,11 @@
             let lastPinch = 0;
 
             function pan(dx, dy) {
-                const wpp = 2 * dist * Math.tan(CFG.fov * DEG / 2) / canvas.clientHeight;
+                // Use effective vertical FOV for pan scale
+                const isH = cam.camera.horizontalFov;
+                const fovRad = CFG.fov * DEG;
+                const fovV = isH ? 2 * Math.atan(Math.tan(fovRad / 2) / (canvas.clientWidth / canvas.clientHeight)) : fovRad;
+                const wpp = 2 * dist * Math.tan(fovV / 2) / canvas.clientHeight;
                 tgtGoal.sub(new pc.Vec3().copy(cam.right).mulScalar(dx * wpp));
                 tgtGoal.add(new pc.Vec3().copy(cam.up).mulScalar(dy * wpp));
                 const o = new pc.Vec3().sub2(tgtGoal, center);
@@ -173,7 +258,7 @@
             canvas.addEventListener('pointerdown', function (e) {
                 try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
                 pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, button: e.button });
-                interacted = true;
+                if (!interacted) { interacted = true; hideHelp(); }
             });
             canvas.addEventListener('pointermove', function (e) {
                 const p = pointers.get(e.pointerId);
@@ -198,7 +283,7 @@
             canvas.addEventListener('pointercancel', endPointer);
             canvas.addEventListener('wheel', function (e) {
                 e.preventDefault();
-                interacted = true;
+                interacted = true; hideHelp();
                 distGoal = clampDist(distGoal * Math.exp(e.deltaY * 0.0012));
             }, { passive: false });
             canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
@@ -234,14 +319,13 @@
                 else document.documentElement.requestFullscreen().catch(function () {});
             });
 
-            // handle chẩn đoán tối thiểu (không cho phép đổi giới hạn qua UI/URL)
             window.__v = {
                 R: R,
                 distFromCenter: function () { return new pc.Vec3().sub2(cam.getPosition(), center).length(); },
                 app: app
             };
         } catch (err) {
-            fail('Trình duyệt không hỗ trợ WebGL2 hoặc có lỗi khởi tạo: ' + (err && err.message ? err.message : err));
+            fail('WebGL2 not supported or init error: ' + (err && err.message ? err.message : err));
         }
     </script>
 </body>
