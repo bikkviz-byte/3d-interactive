@@ -68,7 +68,10 @@
 
         <h2>Xuất cho khách</h2>
         <button class="btn primary" id="exportBtn">⬇️ Xuất file HTML khoá (gửi khách)</button>
-        <button class="btn" id="downloadRawBtn">💾 Tải về file splat gốc (.ply/.sog)</button>
+        <div style="display:flex;gap:6px">
+            <button class="btn" id="downloadRawBtn" style="flex:1">💾 Tải về file gốc</button>
+            <button class="btn" id="downloadPlyBtn" style="flex:1">💾 Xuất thành PLY</button>
+        </div>
         <textarea id="embedOut" readonly spellcheck="false"></textarea>
         <button class="btn" id="copyBtn">📋 Sao chép mã nhúng</button>
         <div style="color:#8b93a5;margin-top:6px;line-height:1.5">
@@ -283,6 +286,62 @@
             return { keptCount, blob: out ? new Blob([out]) : null };
         }
 
+        // Standard 3DGS PLY property list (superset — missing props are skipped automatically)
+        const SPLAT_PROPS = (function () {
+            const p = ['x','y','z','nx','ny','nz','f_dc_0','f_dc_1','f_dc_2'];
+            for (let i = 0; i < 45; i++) p.push('f_rest_' + i);
+            p.push('opacity','scale_0','scale_1','scale_2','rot_0','rot_1','rot_2','rot_3');
+            return p;
+        })();
+
+        // Rebuild a PLY from PlayCanvas splatData — works for both .ply and .sog inputs
+        function buildPlyFromSplatData(sd, keepIdx) {
+            const props = SPLAT_PROPS
+                .map(n => ({ name: n, data: sd.getProp(n) }))
+                .filter(p => p.data != null);
+            const outN = keepIdx ? keepIdx.length : sd.numSplats;
+            const hdr = [
+                'ply', 'format binary_little_endian 1.0',
+                'element vertex ' + outN,
+                ...props.map(p => 'property float ' + p.name),
+                'end_header\n'
+            ].join('\n');
+            const hdrB = new TextEncoder().encode(hdr);
+            const stride = props.length * 4;
+            const out = new Uint8Array(hdrB.length + outN * stride);
+            out.set(hdrB);
+            const view = new DataView(out.buffer, hdrB.length);
+            const indices = keepIdx || (function () { const a = []; for (let i = 0; i < sd.numSplats; i++) a.push(i); return a; })();
+            for (let ii = 0; ii < indices.length; ii++) {
+                const base = ii * stride, idx = indices[ii];
+                for (let p = 0; p < props.length; p++) view.setFloat32(base + p * 4, props[p].data[idx], true);
+            }
+            return new Blob([out], { type: 'application/octet-stream' });
+        }
+
+        // Crop using PlayCanvas splatData — works for .sog (and any format PlayCanvas parsed)
+        async function processAnySplat(cropRUnits, buildOutput) {
+            const res = state.asset && state.asset.resource;
+            const sd = res && (res.splatData || res.gsplatData);
+            if (!sd) return null;
+            const xs = sd.getProp('x'), ys = sd.getProp('y'), zs = sd.getProp('z');
+            if (!xs || !ys || !zs) return null;
+            const cx = -state.center.x, cy = -state.center.y, cz = state.center.z;
+            const r2 = cropRUnits * cropRUnits;
+            const kept = [];
+            for (let i = 0; i < sd.numSplats; i++) {
+                const dx = xs[i] - cx, dy = ys[i] - cy, dz = zs[i] - cz;
+                if (dx*dx + dy*dy + dz*dz <= r2) kept.push(i);
+            }
+            return { keptCount: kept.length, blob: buildOutput ? buildPlyFromSplatData(sd, kept) : null };
+        }
+
+        // Unified router: binary for .ply (fast/exact), splatData for .sog
+        async function processSplat(cropRUnits, buildOutput) {
+            if (state.dataName.toLowerCase().endsWith('.ply')) return processPly(cropRUnits, buildOutput);
+            return processAnySplat(cropRUnits, buildOutput);
+        }
+
         // ── Nạp file ─────────────────────────────────────────────────────
         async function loadFile(file) {
             $('busy').style.display = 'block';
@@ -495,15 +554,17 @@
             if (!state.blob) throw new Error('Chưa có file nào được nạp.');
             const tpl = LOCKED_TEMPLATE;
 
-            // Crop PLY if radius > 0 and file is PLY
+            // Crop if radius > 0 (works for both .ply and .sog)
             const cropM = parseFloat($('inCropR').value) || 0;
-            const canCrop = cropM > 0 && state.dataName.toLowerCase().endsWith('.ply');
             let exportBlob = state.blob;
-            if (canCrop) {
+            let exportDataName = state.dataName;
+            if (cropM > 0) {
                 $('busy').textContent = 'Đang lọc Splat theo bán kính…';
-                const result = await processPly(cropM / state.mpu, true);
+                const result = await processSplat(cropM / state.mpu, true);
                 if (result && result.blob) {
                     exportBlob = result.blob;
+                    // SOG crop outputs PLY — update embedded filename accordingly
+                    exportDataName = state.dataName.replace(/\.sog$/i, '.ply');
                     toast(`Đã lọc: giữ lại ${fmt(result.keptCount)} / ${fmt(state.count)} splat`, 5000);
                 }
             }
@@ -525,7 +586,7 @@
             return tpl
                 .split('__TITLE__').join((state.fileName || 'Scene').replace(/\.[^.]+$/, '') + ' — 3D Viewer')
                 .split('__CFG__').join(JSON.stringify(cfg))
-                .split('__NAME__').join(state.dataName)
+                .split('__NAME__').join(exportDataName)
                 .split("'__DATA__'").join("'" + dataUri + "'");
         }
 
@@ -544,10 +605,6 @@
             if (!state.blob) { toast('Chưa có file nào được nạp.'); return; }
             const cropM = parseFloat($('inCropR').value) || 0;
             const info = $('cropInfo');
-            if (!state.dataName.toLowerCase().endsWith('.ply')) {
-                info.textContent = 'Chỉ hỗ trợ file .ply để đếm / cắt splat.';
-                return;
-            }
             if (cropM <= 0) {
                 info.textContent = state.count > 0 ? `Crop tắt — xuất toàn bộ ${fmt(state.count)} splat.` : 'Đặt bán kính > 0 để đếm.';
                 return;
@@ -555,11 +612,11 @@
             info.textContent = 'Đang đếm…';
             $('cropCountBtn').disabled = true;
             try {
-                const cropR = cropM / state.mpu;
-                const result = await processPly(cropR, false);
-                if (!result) { info.textContent = 'Không đọc được header PLY.'; return; }
+                const result = await processSplat(cropM / state.mpu, false);
+                if (!result) { info.textContent = 'Không truy cập được dữ liệu splat.'; return; }
                 const pct = state.count > 0 ? (result.keptCount / state.count * 100).toFixed(1) : '?';
-                info.textContent = `Bán kính ${cropM} m → ${fmt(result.keptCount)} splat (${pct}% so với ${fmt(state.count)} gốc)`;
+                const note = state.dataName.toLowerCase().endsWith('.sog') ? ' (xuất thành PLY)' : '';
+                info.textContent = `Bán kính ${cropM} m → ${fmt(result.keptCount)} splat (${pct}% so với ${fmt(state.count)} gốc)${note}`;
             } catch (e) {
                 info.textContent = 'Lỗi: ' + (e && e.message ? e.message : e);
             } finally {
@@ -605,6 +662,41 @@
             a.click();
             setTimeout(() => URL.revokeObjectURL(a.href), 30000);
             toast('Đang tải về ' + state.dataName + '…');
+        });
+
+        $('downloadPlyBtn').addEventListener('click', async () => {
+            if (!state.blob) { toast('Chưa có file nào được nạp.'); return; }
+            // PLY input: just download original (already PLY, no conversion)
+            if (state.dataName.toLowerCase().endsWith('.ply')) {
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(state.blob);
+                a.download = state.dataName;
+                a.click();
+                setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+                toast('Tải về ' + state.dataName + ' (đã là PLY)');
+                return;
+            }
+            // SOG → PLY via splatData
+            $('busy').textContent = 'Đang chuyển đổi sang PLY…';
+            $('busy').style.display = 'block';
+            try {
+                const res = state.asset && state.asset.resource;
+                const sd = res && (res.splatData || res.gsplatData);
+                if (!sd) throw new Error('Không truy cập được dữ liệu splat.');
+                const blob = buildPlyFromSplatData(sd, null);
+                const plyName = state.dataName.replace(/\.sog$/i, '.ply');
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = plyName;
+                a.click();
+                setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+                toast('Đã chuyển đổi → ' + plyName + ' (' + fmt(sd.numSplats) + ' splat)', 5000);
+            } catch (e) {
+                toast('Lỗi: ' + (e && e.message ? e.message : e));
+            } finally {
+                $('busy').style.display = 'none';
+                $('busy').textContent = 'Đang xử lý file…';
+            }
         });
 
         $('copyBtn').addEventListener('click', async () => {
