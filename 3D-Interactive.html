@@ -319,21 +319,44 @@
             return new Blob([out], { type: 'application/octet-stream' });
         }
 
-        // Crop using PlayCanvas splatData — works for .sog (and any format PlayCanvas parsed)
+        // Crop using PlayCanvas runtime data — handles both getProp API (PLY) and _centers fallback (SOG)
         async function processAnySplat(cropRUnits, buildOutput) {
             const res = state.asset && state.asset.resource;
-            const sd = res && (res.splatData || res.gsplatData);
-            if (!sd) return null;
-            const xs = sd.getProp('x'), ys = sd.getProp('y'), zs = sd.getProp('z');
-            if (!xs || !ys || !zs) return null;
+            if (!res) return null;
             const cx = -state.center.x, cy = -state.center.y, cz = state.center.z;
             const r2 = cropRUnits * cropRUnits;
-            const kept = [];
-            for (let i = 0; i < sd.numSplats; i++) {
-                const dx = xs[i] - cx, dy = ys[i] - cy, dz = zs[i] - cz;
-                if (dx*dx + dy*dy + dz*dz <= r2) kept.push(i);
+
+            // Path A: splatData with getProp (PLY loaded via splatData)
+            const sd = res.splatData || res.gsplatData;
+            if (sd && typeof sd.getProp === 'function') {
+                const xs = sd.getProp('x'), ys = sd.getProp('y'), zs = sd.getProp('z');
+                if (xs && ys && zs) {
+                    const kept = [];
+                    for (let i = 0; i < sd.numSplats; i++) {
+                        const dx = xs[i] - cx, dy = ys[i] - cy, dz = zs[i] - cz;
+                        if (dx*dx + dy*dy + dz*dz <= r2) kept.push(i);
+                    }
+                    return { keptCount: kept.length, blob: buildOutput ? buildPlyFromSplatData(sd, kept) : null };
+                }
             }
-            return { keptCount: kept.length, blob: buildOutput ? buildPlyFromSplatData(sd, kept) : null };
+
+            // Path B: _centers flat array [x0,y0,z0, x1,y1,z1, ...] — typical for SOG
+            const c = res._centers;
+            if (c && c.length >= 3) {
+                const n = c.length / 3;
+                let count = 0;
+                for (let i = 0; i < n; i++) {
+                    const dx = c[i*3] - cx, dy = c[i*3+1] - cy, dz = c[i*3+2] - cz;
+                    if (dx*dx + dy*dy + dz*dz <= r2) count++;
+                }
+                if (buildOutput) {
+                    // Can count but can't rebuild full PLY without all properties
+                    return { keptCount: count, blob: null, sogLimit: true };
+                }
+                return { keptCount: count, blob: null };
+            }
+
+            return null;
         }
 
         // Unified router: binary for .ply (fast/exact), splatData for .sog
@@ -563,9 +586,10 @@
                 const result = await processSplat(cropM / state.mpu, true);
                 if (result && result.blob) {
                     exportBlob = result.blob;
-                    // SOG crop outputs PLY — update embedded filename accordingly
                     exportDataName = state.dataName.replace(/\.sog$/i, '.ply');
                     toast(`Đã lọc: giữ lại ${fmt(result.keptCount)} / ${fmt(state.count)} splat`, 5000);
+                } else if (result && result.sogLimit) {
+                    toast(`SOG: đếm được ${fmt(result.keptCount)} splat trong bán kính nhưng không thể cắt định dạng SOG — xuất nguyên file gốc.`, 7000);
                 }
             }
 
@@ -676,13 +700,15 @@
                 toast('Tải về ' + state.dataName + ' (đã là PLY)');
                 return;
             }
-            // SOG → PLY via splatData
+            // SOG → PLY via splatData (requires getProp API)
             $('busy').textContent = 'Đang chuyển đổi sang PLY…';
             $('busy').style.display = 'block';
             try {
                 const res = state.asset && state.asset.resource;
                 const sd = res && (res.splatData || res.gsplatData);
-                if (!sd) throw new Error('Không truy cập được dữ liệu splat.');
+                if (!sd || typeof sd.getProp !== 'function') {
+                    throw new Error('File SOG này không hỗ trợ chuyển đổi sang PLY từ trình duyệt. Dùng SuperSplat để xuất PLY rồi nạp lại.');
+                }
                 const blob = buildPlyFromSplatData(sd, null);
                 const plyName = state.dataName.replace(/\.sog$/i, '.ply');
                 const a = document.createElement('a');
