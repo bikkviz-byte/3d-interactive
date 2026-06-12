@@ -58,6 +58,14 @@
         <button class="btn" id="centerViewBtn">Tâm giới hạn = tâm nhìn hiện tại</button>
         <div id="centerInfo" style="color:#8b93a5;margin-top:4px"></div>
 
+        <h2>Tối ưu Splat</h2>
+        <div class="row">
+            <label>Bán kính cắt splat (m) <span style="color:#8b93a5;font-size:10px">0 = tắt</span></label>
+            <input type="number" id="inCropR" value="0" min="0" step="5" style="width:70px">
+        </div>
+        <div id="cropInfo" style="color:#8b93a5;font-size:11.5px;line-height:1.6;margin:4px 0 6px"></div>
+        <button class="btn" id="cropCountBtn">🔢 Đếm Splat trong bán kính</button>
+
         <h2>Xuất cho khách</h2>
         <button class="btn primary" id="exportBtn">⬇️ Xuất file HTML khoá (gửi khách)</button>
         <button class="btn" id="downloadRawBtn">💾 Tải về file splat gốc (.ply/.sog)</button>
@@ -185,6 +193,94 @@
                 try { settings = JSON.parse(text.slice(js, k)); } catch (_) {}
             }
             return { buf, name, settings };
+        }
+
+        // ── PLY crop helpers ─────────────────────────────────────────────
+        function parsePlyHeader(bytes) {
+            const dec = new TextDecoder();
+            let hdrEnd = 0;
+            for (let i = 0; i < Math.min(bytes.length, 16384) - 10; i++) {
+                if (bytes[i] === 0x65 && dec.decode(bytes.slice(i, i + 10)) === 'end_header') {
+                    hdrEnd = i + 10;
+                    if (bytes[hdrEnd] === 0x0D) hdrEnd++;
+                    if (bytes[hdrEnd] === 0x0A) hdrEnd++;
+                    break;
+                }
+            }
+            if (!hdrEnd) return null;
+            const hdrText = dec.decode(bytes.slice(0, hdrEnd));
+            const vMatch = hdrText.match(/element vertex (\d+)/);
+            if (!vMatch) return null;
+            const isBigEndian = hdrText.includes('binary_big_endian');
+            if (!isBigEndian && !hdrText.includes('binary_little_endian')) return null;
+            const sizes = { float:4, float32:4, double:8, float64:8, int:4, int32:4, uint:4, uint32:4,
+                            short:2, int16:2, ushort:2, uint16:2, char:1, int8:1, uchar:1, uint8:1 };
+            let stride = 0, xOff = -1, yOff = -1, zOff = -1;
+            for (const line of hdrText.split('\n')) {
+                const p = line.trim().split(/\s+/);
+                if (p[0] !== 'property' || p[1] === 'list') continue;
+                const sz = sizes[p[1].toLowerCase()] || 4;
+                if (p[2] === 'x') xOff = stride;
+                if (p[2] === 'y') yOff = stride;
+                if (p[2] === 'z') zOff = stride;
+                stride += sz;
+            }
+            if (xOff < 0 || yOff < 0 || zOff < 0 || stride === 0) return null;
+            return { count: parseInt(vMatch[1]), stride, xOff, yOff, zOff, hdrLen: hdrEnd, isBigEndian, hdrText };
+        }
+
+        // Returns { keptCount, blob } — blob is null if only counting.
+        async function processPly(cropRUnits, buildOutput) {
+            const buf = await state.blob.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            const hdr = parsePlyHeader(bytes);
+            if (!hdr) return null;
+
+            // scene→PLY: scene rotation 180°Z means ply_x=-scene_x, ply_y=-scene_y, ply_z=scene_z
+            const cx = -state.center.x, cy = -state.center.y, cz = state.center.z;
+            const r2 = cropRUnits * cropRUnits;
+            const view = new DataView(buf);
+            const isLE = !hdr.isBigEndian;
+
+            let keptCount = 0;
+            let out = null, outOff = 0;
+
+            if (buildOutput) {
+                // Pass 1: count
+                let off = hdr.hdrLen;
+                for (let i = 0; i < hdr.count; i++, off += hdr.stride) {
+                    const dx = view.getFloat32(off + hdr.xOff, isLE) - cx;
+                    const dy = view.getFloat32(off + hdr.yOff, isLE) - cy;
+                    const dz = view.getFloat32(off + hdr.zOff, isLE) - cz;
+                    if (dx*dx + dy*dy + dz*dz <= r2) keptCount++;
+                }
+                const newHdr = hdr.hdrText.replace(/element vertex \d+/, 'element vertex ' + keptCount);
+                const newHdrBytes = new TextEncoder().encode(newHdr);
+                out = new Uint8Array(newHdrBytes.length + keptCount * hdr.stride);
+                out.set(newHdrBytes);
+                outOff = newHdrBytes.length;
+                // Pass 2: copy
+                off = hdr.hdrLen;
+                for (let i = 0; i < hdr.count; i++, off += hdr.stride) {
+                    const dx = view.getFloat32(off + hdr.xOff, isLE) - cx;
+                    const dy = view.getFloat32(off + hdr.yOff, isLE) - cy;
+                    const dz = view.getFloat32(off + hdr.zOff, isLE) - cz;
+                    if (dx*dx + dy*dy + dz*dz <= r2) {
+                        out.set(new Uint8Array(buf, off, hdr.stride), outOff);
+                        outOff += hdr.stride;
+                    }
+                }
+            } else {
+                // Count only (single pass)
+                let off = hdr.hdrLen;
+                for (let i = 0; i < hdr.count; i++, off += hdr.stride) {
+                    const dx = view.getFloat32(off + hdr.xOff, isLE) - cx;
+                    const dy = view.getFloat32(off + hdr.yOff, isLE) - cy;
+                    const dz = view.getFloat32(off + hdr.zOff, isLE) - cz;
+                    if (dx*dx + dy*dy + dz*dz <= r2) keptCount++;
+                }
+            }
+            return { keptCount, blob: out ? new Blob([out]) : null };
         }
 
         // ── Nạp file ─────────────────────────────────────────────────────
@@ -398,11 +494,25 @@
         async function buildLockedHtml() {
             if (!state.blob) throw new Error('Chưa có file nào được nạp.');
             const tpl = LOCKED_TEMPLATE;
+
+            // Crop PLY if radius > 0 and file is PLY
+            const cropM = parseFloat($('inCropR').value) || 0;
+            const canCrop = cropM > 0 && state.dataName.toLowerCase().endsWith('.ply');
+            let exportBlob = state.blob;
+            if (canCrop) {
+                $('busy').textContent = 'Đang lọc Splat theo bán kính…';
+                const result = await processPly(cropM / state.mpu, true);
+                if (result && result.blob) {
+                    exportBlob = result.blob;
+                    toast(`Đã lọc: giữ lại ${fmt(result.keptCount)} / ${fmt(state.count)} splat`, 5000);
+                }
+            }
+
             const dataUri = await new Promise((res, rej) => {
                 const fr = new FileReader();
                 fr.onload  = () => res(fr.result);
                 fr.onerror = () => rej(new Error('Không đọc được dữ liệu splat.'));
-                fr.readAsDataURL(new Blob([state.blob], { type: 'application/octet-stream' }));
+                fr.readAsDataURL(new Blob([exportBlob], { type: 'application/octet-stream' }));
             });
             const cp2 = cam.getPosition();
             const cfg = {
@@ -429,6 +539,33 @@
         bind('inMpu', 'mpu');
         bind('inSphere', 'showSphere', true);
         bind('inRotate', 'autorotate', true);
+
+        $('cropCountBtn').addEventListener('click', async () => {
+            if (!state.blob) { toast('Chưa có file nào được nạp.'); return; }
+            const cropM = parseFloat($('inCropR').value) || 0;
+            const info = $('cropInfo');
+            if (!state.dataName.toLowerCase().endsWith('.ply')) {
+                info.textContent = 'Chỉ hỗ trợ file .ply để đếm / cắt splat.';
+                return;
+            }
+            if (cropM <= 0) {
+                info.textContent = state.count > 0 ? `Crop tắt — xuất toàn bộ ${fmt(state.count)} splat.` : 'Đặt bán kính > 0 để đếm.';
+                return;
+            }
+            info.textContent = 'Đang đếm…';
+            $('cropCountBtn').disabled = true;
+            try {
+                const cropR = cropM / state.mpu;
+                const result = await processPly(cropR, false);
+                if (!result) { info.textContent = 'Không đọc được header PLY.'; return; }
+                const pct = state.count > 0 ? (result.keptCount / state.count * 100).toFixed(1) : '?';
+                info.textContent = `Bán kính ${cropM} m → ${fmt(result.keptCount)} splat (${pct}% so với ${fmt(state.count)} gốc)`;
+            } catch (e) {
+                info.textContent = 'Lỗi: ' + (e && e.message ? e.message : e);
+            } finally {
+                $('cropCountBtn').disabled = false;
+            }
+        });
 
         $('centerSceneBtn').addEventListener('click', () => {
             state.center.set(
